@@ -15,7 +15,7 @@ int main() {
     printf("L2 Cache Size:            %.2f MB (%d bytes)\n", 
            props.l2CacheSize / (1024.0 * 1024.0), props.l2CacheSize);
     
-    printf("Shared Mem per Block:     %.2f KB\n", props.sharedMemPerBlock / 1024.0);
+    printf("Maximum shared memory available to a single thread block:     %.2f KB\n", props.sharedMemPerBlock / 1024.0);
     printf("Registers per Block:      %d\n", props.regsPerBlock);
     
     // Theoretical limit check

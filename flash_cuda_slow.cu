@@ -69,6 +69,7 @@ __global__ void naive_backward_kernel(
             }
             dV[idx * d + x] = __float2half(sum);
         }
+        // both dP and dS are computed twice for dQ and dK
         // dQ
         for (int x = 0; x < d; x++) {
             float sum = 0.0f;
@@ -200,6 +201,7 @@ __global__ void compute_full_P_half(const half* Q, const half* K, half* P, const
         P[row * n + col] = __float2half(expf(dot * scale - m[row]) / L[row]);
     }
 }
+// Helper: Convert float to half
 __global__ void float2half_kernel(half* out, const float* in, int size) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < size) out[i] = __float2half(in[i]);
@@ -214,7 +216,11 @@ __global__ void compute_delta_half(const half* dO, const half* O, float* Delta, 
 }
 
 int main() {
+    // seq lengths to test
     int test_sizes[] = {2048, 4096, 8192, 16384};
+    // head dimension = 64
+    // batch size = 1
+    // number of heads = 1
     int num_tests = 4;
 
     printf("======================================================\n");
@@ -245,7 +251,10 @@ int main() {
         CHECK_CUDA(cudaMalloc(&d_flush, flush_size * sizeof(float)));
         CHECK_CUDA(cudaMemset(d_flush, 0, flush_size * sizeof(float)));
 
-        // Init Data
+        // Init Data: all inputs filled with constant 0.1f for benchmarking purposes only.
+        // Not realistic data — goal is to measure memory access latency, not correctness.
+        // d_L and d_m (softmax statistics) are left uninitialized; only flash_optimized_half
+        // uses them, and correctness is not verified here.
         float* h_dummy = (float*)malloc(n*D*4);
         for(int i=0;i<n*D;i++) h_dummy[i]=0.1f;
         float* d_temp; cudaMalloc(&d_temp, n*D*4);

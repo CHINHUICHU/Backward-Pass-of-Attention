@@ -26,8 +26,8 @@ The analysis is performed using a fixed head dimension D=64 and `half` (FP16) pr
 
 | File Name | Description | Purpose |
 | :--- | :--- | :--- |
-| `flash_cuda_slow.cu` | **Performance Comparison Kernels** | Contains the three kernels profiled for comparison: 1. `naive_backward_kernel`, 2. `tiled_uncoalesced_kernel`, and 3. `flash_optimized_half`. This file provides the core speed contrast. |
-| `flash_cuda_flash.cu` | **Block Size Optimization Study** | Focuses solely on the optimized `flash_optimized_half` kernel and benchmarks its performance across various tiling configurations (4x4, 8x8, 16x16, 32x32) to find the optimal block size for the target GPU. |
+| `flash_cuda_slow.cu` | **Performance Comparison Kernels** | Benchmarks three kernels against each other to show the performance progression: (1) `naive_backward_kernel` — reads the N×N attention matrix P from global memory D times, extremely slow; (2) `tiled_uncoalesced_kernel` — adds tiling but with broken memory coalescing (strided access); (3) `flash_optimized_half` — full Flash Attention with shared memory caching and P recomputation. Answers: *how much faster is Flash vs naive?* |
+| `flash_cuda_flash.cu` | **Block Size Optimization Study** | Takes only the optimized Flash kernel (as a C++ template `<BR, BC>`) and benchmarks it across four tile sizes (4×4, 8×8, 16×16, 32×32) to find the optimal block size for the target GPU. Unlike `flash_cuda_slow.cu`, this file requires no pre-computed P matrix — it recomputes attention weights on-the-fly. Answers: *what is the best tile size for Flash on this GPU?* |
 | `check_specs.cu` | **Hardware Analysis** | A utility program that reads and prints key GPU specifications (Compute Capability, L2 Cache Size, Shared Memory per Block) and calculates the **minimum working set size** for the attention problem to justify the memory-bound nature of the naive approach. |
 | `README.md` | *This file.* | Project documentation and usage guide. |
 
@@ -51,3 +51,26 @@ nvcc check_specs.cu -o check_specs
 ./check_specs
 ```
 This README was generated using Gemini.
+
+---
+
+## Hardware Specifications (Test Machine)
+
+Output of `./check_specs` on the development machine:
+
+```
+=== GPU SPECIFICATIONS: NVIDIA GeForce RTX 4090 ===
+Compute Capability:       8.9
+Global Memory (VRAM):     23.54 GB
+L2 Cache Size:            72.00 MB (75497472 bytes)
+Shared Mem per Block:     48.00 KB
+Registers per Block:      65536
+
+=== ANALYSIS FOR N=16384 ===
+Size of ONE tensor (Q):   2.00 MB
+Min Working Set (Q+K+V):  6.00 MB
+RESULT: Fits in L2 Cache.
+```
+
+
+- Only backward kernels are implemented.
