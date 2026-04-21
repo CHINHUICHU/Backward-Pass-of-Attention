@@ -1,17 +1,27 @@
 NVCC = /usr/local/cuda-12.4/bin/nvcc
 FLAGS = -O2 -arch=sm_86 -lm
+DEBUG_FLAGS = -g -G -O0 -arch=sm_86 -lm
 
-TARGETS = flash_cuda_slow flash_cuda_flash check_specs
+TARGETS = flash_cuda_slow flash_cuda_flash forward check_specs cpu_backward_check
 
 all: $(TARGETS)
 
 flash_cuda_slow: flash_cuda_slow.cu
 	$(NVCC) $(FLAGS) $< -o $@
 
+flash_cuda_slow_debug: flash_cuda_slow.cu
+	$(NVCC) $(DEBUG_FLAGS) $< -o $@
+
 flash_cuda_flash: flash_cuda_flash.cu
 	$(NVCC) $(FLAGS) $< -o $@
 
+forward: forward.cu
+	$(NVCC) $(FLAGS) $< -o $@
+
 check_specs: check_specs.cu
+	$(NVCC) $(FLAGS) $< -o $@
+
+cpu_backward_check: cpu_backward_check.cu
 	$(NVCC) $(FLAGS) $< -o $@
 
 clean:
