@@ -86,6 +86,62 @@ __global__ void rowwise_forward_kernel(
 }
 
 // ---------------------------------------------------------------
+// Row-Wise Forward Pass (Separate Kernels)
+// ---------------------------------------------------------------
+
+// Step 1: thread i computes row i of S = Q K^T
+__global__ void compute_S_kernel(
+    const half* __restrict__ Q,
+    const half* __restrict__ K,
+    float* __restrict__ S,
+    int T, int d
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= T) return;
+    size_t row_Q = (size_t)i * d;
+    for (int j = 0; j < T; j++) {
+        float dot = 0.0f;
+        size_t row_K = (size_t)j * d;
+        for (int x = 0; x < d; x++)
+            dot += __half2float(Q[row_Q + x]) * __half2float(K[row_K + x]);
+        S[(size_t)i * T + j] = dot;
+    }
+}
+
+// Step 2: thread i applies softmax to row i of S in-place
+__global__ void compute_softmax_kernel(
+    float* __restrict__ S,
+    int T
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= T) return;
+    size_t row = (size_t)i * T;
+    float sum = 0.0f;
+    for (int j = 0; j < T; j++) { S[row + j] = expf(S[row + j]); sum += S[row + j]; }
+    float inv_sum = (sum > 0) ? (1.0f / sum) : 0.0f;
+    for (int j = 0; j < T; j++) S[row + j] *= inv_sum;
+}
+
+// Step 3: thread i computes row i of O = P V
+__global__ void compute_O_kernel(
+    const float* __restrict__ P,
+    const half* __restrict__ V,
+    half* __restrict__ O,
+    int T, int d
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= T) return;
+    size_t row_P = (size_t)i * T;
+    size_t row_O = (size_t)i * d;
+    for (int x = 0; x < d; x++) {
+        float acc = 0.0f;
+        for (int j = 0; j < T; j++)
+            acc += P[row_P + j] * __half2float(V[(size_t)j * d + x]);
+        O[row_O + x] = __float2half(acc);
+    }
+}
+
+// ---------------------------------------------------------------
 // Flash Forward (Memory Efficient)
 // ---------------------------------------------------------------
 __global__ void flash_forward_kernel(
@@ -158,10 +214,10 @@ int main() {
     float *d_flush;
     CHECK_CUDA(cudaMalloc(&d_flush, flush_size * sizeof(float)));
 
-    printf("=========================================================\n");
-    printf("|              Forward Pass Benchmark                   |\n");
-    printf("| %-8s | %-15s | %-15s |\n", "Seq Len", "Naive(ms)", "Flash(ms)");
-    printf("=========================================================\n");
+    printf("=======================================================================\n");
+    printf("|                   Forward Pass Benchmark                          |\n");
+    printf("| %-8s | %-15s | %-15s | %-15s |\n", "Seq Len", "Naive(ms)", "Separate(ms)", "Flash(ms)");
+    printf("=======================================================================\n");
 
     for (int t = 0; t < num_fwd; t++) {
         int T = fwd_sizes[t];
@@ -207,6 +263,21 @@ int main() {
             cudaEventElapsedTime(&ms_naive, start, stop);
         }
 
+        // --- SEPARATE KERNELS RUN ---
+        float ms_sep = -1.0f;
+        if (d_S != nullptr) {
+            cudaMemset(d_O, 0, sz_h);
+            flush_l2_cache_kernel<<<flush_size/256, 256>>>(d_flush, flush_size);
+            cudaDeviceSynchronize();
+            cudaEventRecord(start);
+            compute_S_kernel<<<(T+255)/256, 256>>>(d_Q, d_K, d_S, T, D);
+            compute_softmax_kernel<<<(T+255)/256, 256>>>(d_S, T);
+            compute_O_kernel<<<(T+255)/256, 256>>>(d_S, d_V, d_O, T, D);
+            cudaEventRecord(stop);
+            cudaEventSynchronize(stop);
+            cudaEventElapsedTime(&ms_sep, start, stop);
+        }
+
         // --- FLASH RUN ---
         float ms_ff = -1.0f;
         flush_l2_cache_kernel<<<flush_size/256, 256>>>(d_flush, flush_size);
@@ -230,17 +301,18 @@ int main() {
         }
 
         // --- LOGGING ---
-        char n_str[16], f_str[64];
+        char n_str[16], s_str[16], f_str[64];
         if (ms_naive < 0) sprintf(n_str, "OOM/SKIP"); else sprintf(n_str, "%.2f", ms_naive);
+        if (ms_sep < 0)   sprintf(s_str, "OOM/SKIP"); else sprintf(s_str, "%.2f", ms_sep);
         if (ms_ff < 0)    snprintf(f_str, sizeof(f_str), "ERR: %s", flash_err_str ? flash_err_str : "unknown");
         else              sprintf(f_str, "%.2f", ms_ff);
-        printf("| %-8d | %-15s | %-15s |\n", T, n_str, f_str);
+        printf("| %-8d | %-15s | %-15s | %-15s |\n", T, n_str, s_str, f_str);
 
         if (d_S) cudaFree(d_S);
         cudaFree(d_Q); cudaFree(d_K); cudaFree(d_V); cudaFree(d_O); cudaFree(d_Delta);
         cudaEventDestroy(start); cudaEventDestroy(stop);
     }
-    printf("=========================================================\n");
+    printf("=======================================================================\n");
 
     cudaFree(d_flush);
     return 0;
