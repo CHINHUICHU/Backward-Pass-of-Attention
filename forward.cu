@@ -2,11 +2,10 @@
 #include <stdlib.h>
 #include <math.h>
 #include <cuda_runtime.h>
-#include <cuda_fp16.h>
 
 #define D 64         // Head Dimension
-#define BR 16        // Block Row Size
-#define BC 16        // Block Col Size
+#define BR 64        // Block Row Size
+#define BC 32        // Block Col Size
 
 #define CHECK_CUDA(call) \
 { \
@@ -26,10 +25,9 @@ inline void clear_cuda_error() {
 // Initialization & Utility Kernels
 // ---------------------------------------------------------------
 
-// Sets half values directly on GPU to avoid CPU-GPU transfer overhead
-__global__ void fill_half_kernel(half* data, float value, size_t size) {
+__global__ void fill_float_kernel(float* data, float value, size_t size) {
     size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < size) data[i] = __float2half(value);
+    if (i < size) data[i] = value;
 }
 
 __global__ void flush_l2_cache_kernel(float* buffer, int size) {
@@ -38,241 +36,188 @@ __global__ void flush_l2_cache_kernel(float* buffer, int size) {
 }
 
 // ---------------------------------------------------------------
-// Row-Wise Forward Pass (Naive)
+// General MatMul Kernel
 // ---------------------------------------------------------------
-__global__ void rowwise_forward_kernel(
-    const half* __restrict__ Q,
-    const half* __restrict__ K,
-    const half* __restrict__ V,
-    float* __restrict__ S,
-    half* __restrict__ O,
-    int T, int d
+
+__device__ inline float to_float(float x) { return x; }
+
+template<typename T> __device__ inline T from_float(float x);
+template<> __device__ inline float from_float<float>(float x) { return x; }
+
+// C[M x N] = A[M x K] @ B_eff[K x N], one thread per row of C.
+// transB=true: B is stored as [N x K], i.e. B[j, x] = B[j*K + x].
+template<typename TA, typename TB, typename TC>
+__global__ void matmul_kernel(
+    const TA* __restrict__ A,
+    const TB* __restrict__ B,
+    TC* __restrict__ C,
+    int M, int N, int K,
+    bool transB
 ) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= T) return;
-
-    size_t row_offset_S = (size_t)i * T;
-    size_t row_offset_QD = (size_t)i * d;
-
-    // Eq 1: S_{i,:} = Q_{i,:} K^T
-    for (int j = 0; j < T; j++) {
-        float dot = 0.0f;
-        size_t row_offset_KD = (size_t)j * d;
-        for (int x = 0; x < d; x++) {
-            dot += __half2float(Q[row_offset_QD + x]) * __half2float(K[row_offset_KD + x]);
-        }
-        S[row_offset_S + j] = dot;
-    }
-
-    // Eq 2: SoftMax P directly use S space
-    float sum = 0.0f;
-    for (int j = 0; j < T; j++) { 
-        S[row_offset_S + j] = expf(S[row_offset_S + j]); 
-        sum += S[row_offset_S + j]; 
-    }
-    float inv_sum = (sum > 0) ? (1.0f / sum) : 0.0f;
-    for (int j = 0; j < T; j++) {
-        S[row_offset_S + j] *= inv_sum;
-    }
-
-    // Eq 3: O_{i,:} = P_{i,:} V
-    for (int x = 0; x < d; x++) {
+    if (i >= M) return;
+    for (int j = 0; j < N; j++) {
         float acc = 0.0f;
-        for (int j = 0; j < T; j++) {
-            acc += S[row_offset_S + j] * __half2float(V[(size_t)j * d + x]);
+        for (int x = 0; x < K; x++) {
+            float a = to_float(A[(size_t)i * K + x]);
+            float b = transB ? to_float(B[(size_t)j * K + x])
+                             : to_float(B[(size_t)x * N + j]);
+            acc += a * b;
         }
-        O[row_offset_QD + x] = __float2half(acc);
+        C[(size_t)i * N + j] = from_float<TC>(acc);
     }
 }
 
 // ---------------------------------------------------------------
-// Row-Wise Forward Pass (Separate Kernels)
+// Standard Attention (register-only, no shared memory)
 // ---------------------------------------------------------------
 
-// Step 1: thread i computes row i of S = Q K^T
-__global__ void compute_S_kernel(
-    const half* __restrict__ Q,
-    const half* __restrict__ K,
-    float* __restrict__ S,
-    int T, int d
-) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= T) return;
-    size_t row_Q = (size_t)i * d;
+// In-place softmax over rows of S[T x T].
+// 1D block (BR threads), thread tx owns one row. Two passes over global S.
+__global__ void compute_softmax_kernel(float* __restrict__ S, int T) {
+    int row = blockIdx.x * BR + threadIdx.x;
+    if (row >= T) return;
+
+    float row_sum = 0.0f;
     for (int j = 0; j < T; j++) {
-        float dot = 0.0f;
-        size_t row_K = (size_t)j * d;
-        for (int x = 0; x < d; x++)
-            dot += __half2float(Q[row_Q + x]) * __half2float(K[row_K + x]);
-        S[(size_t)i * T + j] = dot;
+        float e = expf(S[(size_t)row * T + j]);
+        S[(size_t)row * T + j] = e;
+        row_sum += e;
     }
+    float inv_sum = 1.0f / row_sum;
+    for (int j = 0; j < T; j++) S[(size_t)row * T + j] *= inv_sum;
 }
 
-// Step 2: thread i applies softmax to row i of S in-place
-__global__ void compute_softmax_kernel(
-    float* __restrict__ S,
-    int T
-) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= T) return;
-    size_t row = (size_t)i * T;
-    float sum = 0.0f;
-    for (int j = 0; j < T; j++) { S[row + j] = expf(S[row + j]); sum += S[row + j]; }
-    float inv_sum = (sum > 0) ? (1.0f / sum) : 0.0f;
-    for (int j = 0; j < T; j++) S[row + j] *= inv_sum;
-}
-
-// Step 3: thread i computes row i of O = P V
-__global__ void compute_O_kernel(
-    const float* __restrict__ P,
-    const half* __restrict__ V,
-    half* __restrict__ O,
+// Runs standard attention: S = Q K^T, P = softmax(S), O = P V.
+// Reuses matmul_kernel for both matmuls. S is a [T x T] float scratch buffer.
+void standard_attention(
+    const float* Q, const float* K, const float* V,
+    float* S, float* O,
     int T, int d
 ) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= T) return;
-    size_t row_P = (size_t)i * T;
-    size_t row_O = (size_t)i * d;
-    for (int x = 0; x < d; x++) {
-        float acc = 0.0f;
-        for (int j = 0; j < T; j++)
-            acc += P[row_P + j] * __half2float(V[(size_t)j * d + x]);
-        O[row_O + x] = __float2half(acc);
-    }
+    int Tr = (T + BR - 1) / BR;
+
+    // S = Q @ K^T
+    matmul_kernel<float, float, float><<<Tr, BR>>>(Q, K, S, T, T, D, true);
+
+    // softmax(S) in-place
+    compute_softmax_kernel<<<Tr, BR>>>(S, T);
+
+    // O = S @ V
+    matmul_kernel<float, float, float><<<Tr, BR>>>(S, V, O, T, D, T, false);
 }
 
 // ---------------------------------------------------------------
-// Flash Forward (Memory Efficient)
+// Flash Forward (Register-only)
 // ---------------------------------------------------------------
+//
+// Qi[D], Oi[D], Pij[BC] held entirely in per-thread registers.
+// K and V read directly from HBM each j-iteration.
+// Threads are fully independent: no shared memory, no __syncthreads.
+// Launch: grid = (Tr,), block = (Br,). Thread tx owns row tx.
 __global__ void flash_forward_kernel(
-    const half* __restrict__ Q,
-    const half* __restrict__ K,
-    const half* __restrict__ V,
-    half* __restrict__ O,
+    const float* __restrict__ Q,
+    const float* __restrict__ K,
+    const float* __restrict__ V,
+    float* __restrict__ O,
     float* __restrict__ Delta,
     int T
 ) {
-    int tx = threadIdx.x;   
-    int ty = threadIdx.y;   
-    int q_idx = blockIdx.x * BR + ty;
+    int q_idx = blockIdx.x * BR + threadIdx.x;
     if (q_idx >= T) return;
 
-    size_t q_row_offset = (size_t)q_idx * D;
+    float qi[D] = {}, oi[D] = {};
+    for (int x = 0; x < D; x++) qi[x] = Q[(size_t)q_idx * D + x];
 
-    float O_i[D / BC];
-    for (int k = 0; k < D / BC; k++) {
-        O_i[k] = 0.0f;
-    }
     float Delta_i = 0.0f;
+    int Tc = (T + BC - 1) / BC;
 
-    for (int j_start = 0; j_start < T; j_start += BC) {
-        float P_tile[BC];
-        for (int k_row = 0; k_row < BC; k_row++) {
-            int global_k = j_start + k_row;
-            if (global_k < T) {
-                float dot = 0.0f;
-                size_t k_row_offset = (size_t)global_k * D;
-                for (int x = 0; x < D; x++) {
-                    dot += __half2float(Q[q_row_offset + x]) * __half2float(K[k_row_offset + x]);
-                }
-                P_tile[k_row] = expf(dot);
-            } else {
-                P_tile[k_row] = 0.0f;
+    for (int j = 0; j < Tc; j++) {
+        float pij[BC] = {};
+        float Delta_old = Delta_i;
+
+        // Pij = exp(Qi . Kj^T); load Kj row-by-row from HBM
+        for (int y = 0; y < BC; y++) {
+            int k_idx = j * BC + y;
+            float dot = 0.0f;
+            if (k_idx < T) {
+                for (int x = 0; x < D; x++)
+                    dot += qi[x] * K[(size_t)k_idx * D + x];
             }
+            pij[y] = expf(dot);
+            Delta_i += pij[y];
         }
 
-        for (int k_row = 0; k_row < BC; k_row++) {
-            int global_k = j_start + k_row;
-            if (global_k >= T) continue;
-
-            float Delta_old = Delta_i;
-            Delta_i += P_tile[k_row];
-            float inv_Di    = (Delta_i > 0) ? (1.0f / Delta_i) : 0.0f;
-
-            size_t v_row_offset = (size_t)global_k * D;
-            for (int k = 0; k < D / BC; k++) {
-                int x = tx + k * BC;
-                O_i[k] = (Delta_old * inv_Di) * O_i[k] + (P_tile[k_row] * inv_Di) * __half2float(V[v_row_offset + x]);
+        // Oi <- (Delta_old/Delta_i)*Oi + (1/Delta_i)*Pij*Vj; load Vj from HBM
+        float inv_Di    = 1.0f / Delta_i;
+        float scale_old = Delta_old * inv_Di;
+        for (int x = 0; x < D; x++) {
+            float pv = 0.0f;
+            for (int y = 0; y < BC; y++) {
+                int k_idx = j * BC + y;
+                if (k_idx < T) pv += pij[y] * V[(size_t)k_idx * D + x];
             }
+            oi[x] = scale_old * oi[x] + inv_Di * pv;
         }
     }
 
-    for (int k = 0; k < D / BC; k++) {
-        O[q_row_offset + tx + k * BC] = __float2half(O_i[k]);
-    }
-    
-    if (tx == 0) {
-        Delta[q_idx] = Delta_i;
-    }
+    for (int x = 0; x < D; x++) O[(size_t)q_idx * D + x] = oi[x];
+    Delta[q_idx] = Delta_i;
 }
 
 int main() {
-    int fwd_sizes[] = {1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072};
-    int num_fwd = 8;
+    int fwd_sizes[] = {1024, 2048, 4096, 8192, 16384, 32768, 65536};
+    int num_fwd = 7;
 
     int flush_size = 64 * 1024 * 1024;
-    float *d_flush;
-    CHECK_CUDA(cudaMalloc(&d_flush, flush_size * sizeof(float)));
+    float *flush_buf;
+    CHECK_CUDA(cudaMalloc(&flush_buf, flush_size * sizeof(float)));
 
-    printf("=======================================================================\n");
-    printf("|                   Forward Pass Benchmark                          |\n");
-    printf("| %-8s | %-15s | %-15s | %-15s |\n", "Seq Len", "Naive(ms)", "Separate(ms)", "Flash(ms)");
-    printf("=======================================================================\n");
+    printf("===========================================================\n");
+    printf("|              Forward Pass Benchmark                    |\n");
+    printf("| %-8s | %-15s | %-15s |\n", "Seq Len", "Separate(ms)", "Flash(ms)");
+    printf("===========================================================\n");
 
     for (int t = 0; t < num_fwd; t++) {
         int T = fwd_sizes[t];
-        size_t sz_h = (size_t)T * D * sizeof(half);
+        size_t sz_f = (size_t)T * D * sizeof(float);
         size_t sz_s = (size_t)T * T * sizeof(float);
 
-        half *d_Q, *d_K, *d_V, *d_O;
-        float *d_Delta, *d_S = nullptr;
+        float *Q, *K, *V, *O;
+        float *Delta, *S = nullptr;
 
-        CHECK_CUDA(cudaMalloc(&d_Q, sz_h));
-        CHECK_CUDA(cudaMalloc(&d_K, sz_h));
-        CHECK_CUDA(cudaMalloc(&d_V, sz_h));
-        CHECK_CUDA(cudaMalloc(&d_O, sz_h));
-        CHECK_CUDA(cudaMalloc(&d_Delta, T * sizeof(float)));
+        CHECK_CUDA(cudaMalloc(&Q, sz_f));
+        CHECK_CUDA(cudaMalloc(&K, sz_f));
+        CHECK_CUDA(cudaMalloc(&V, sz_f));
+        CHECK_CUDA(cudaMalloc(&O, sz_f));
+        CHECK_CUDA(cudaMalloc(&Delta, T * sizeof(float)));
 
         // Attempt allocation for Naive scratchpad (S). Will fail if > GPU VRAM.
-        cudaError_t s_malloc_err = cudaMalloc(&d_S, sz_s);
+        cudaError_t s_malloc_err = cudaMalloc(&S, sz_s);
         if (s_malloc_err != cudaSuccess) {
             clear_cuda_error(); // Resets flag so we don't skip the Flash kernel too
-            d_S = nullptr;
+            S = nullptr;
         }
 
         // --- INITIALIZATION ---
         size_t total_elements = (size_t)T * D;
-        fill_half_kernel<<<(total_elements + 255)/256, 256>>>(d_Q, 0.1f, total_elements);
-        fill_half_kernel<<<(total_elements + 255)/256, 256>>>(d_K, 0.1f, total_elements);
-        fill_half_kernel<<<(total_elements + 255)/256, 256>>>(d_V, 0.1f, total_elements);
-        cudaMemset(d_O, 0, sz_h);
-        cudaMemset(d_Delta, 0, T * sizeof(float));
+        fill_float_kernel<<<(total_elements + 255)/256, 256>>>(Q, 0.1f, total_elements);
+        fill_float_kernel<<<(total_elements + 255)/256, 256>>>(K, 0.1f, total_elements);
+        fill_float_kernel<<<(total_elements + 255)/256, 256>>>(V, 0.1f, total_elements);
+        cudaMemset(O, 0, sz_f);
+        cudaMemset(Delta, 0, T * sizeof(float));
 
         cudaEvent_t start, stop;
         cudaEventCreate(&start); cudaEventCreate(&stop);
 
-        // --- NAIVE RUN ---
-        float ms_naive = -1.0f;
-        if (d_S != nullptr) {
-            flush_l2_cache_kernel<<<flush_size/256, 256>>>(d_flush, flush_size);
-            cudaDeviceSynchronize();
-            cudaEventRecord(start);
-            rowwise_forward_kernel<<<(T+255)/256, 256>>>(d_Q, d_K, d_V, d_S, d_O, T, D);
-            cudaEventRecord(stop);
-            cudaEventSynchronize(stop);
-            cudaEventElapsedTime(&ms_naive, start, stop);
-        }
-
         // --- SEPARATE KERNELS RUN ---
         float ms_sep = -1.0f;
-        if (d_S != nullptr) {
-            cudaMemset(d_O, 0, sz_h);
-            flush_l2_cache_kernel<<<flush_size/256, 256>>>(d_flush, flush_size);
+        if (S != nullptr) {
+            cudaMemset(O, 0, sz_f);
+            flush_l2_cache_kernel<<<flush_size/256, 256>>>(flush_buf, flush_size);
             cudaDeviceSynchronize();
             cudaEventRecord(start);
-            compute_S_kernel<<<(T+255)/256, 256>>>(d_Q, d_K, d_S, T, D);
-            compute_softmax_kernel<<<(T+255)/256, 256>>>(d_S, T);
-            compute_O_kernel<<<(T+255)/256, 256>>>(d_S, d_V, d_O, T, D);
+            standard_attention(Q, K, V, S, O, T, D);
             cudaEventRecord(stop);
             cudaEventSynchronize(stop);
             cudaEventElapsedTime(&ms_sep, start, stop);
@@ -280,13 +225,13 @@ int main() {
 
         // --- FLASH RUN ---
         float ms_ff = -1.0f;
-        flush_l2_cache_kernel<<<flush_size/256, 256>>>(d_flush, flush_size);
+        flush_l2_cache_kernel<<<flush_size/256, 256>>>(flush_buf, flush_size);
         cudaDeviceSynchronize();
         cudaEventRecord(start);
         {
-            dim3 block(BC, BR);
+            dim3 block(BR);
             dim3 grid((T + BR - 1) / BR);
-            flash_forward_kernel<<<grid, block>>>(d_Q, d_K, d_V, d_O, d_Delta, T);
+            flash_forward_kernel<<<grid, block>>>(Q, K, V, O, Delta, T);
         }
         cudaEventRecord(stop);
         const char *flash_err_str = nullptr;
@@ -301,19 +246,18 @@ int main() {
         }
 
         // --- LOGGING ---
-        char n_str[16], s_str[16], f_str[64];
-        if (ms_naive < 0) sprintf(n_str, "OOM/SKIP"); else sprintf(n_str, "%.2f", ms_naive);
+        char s_str[16], f_str[64];
         if (ms_sep < 0)   sprintf(s_str, "OOM/SKIP"); else sprintf(s_str, "%.2f", ms_sep);
         if (ms_ff < 0)    snprintf(f_str, sizeof(f_str), "ERR: %s", flash_err_str ? flash_err_str : "unknown");
         else              sprintf(f_str, "%.2f", ms_ff);
-        printf("| %-8d | %-15s | %-15s | %-15s |\n", T, n_str, s_str, f_str);
+        printf("| %-8d | %-15s | %-15s |\n", T, s_str, f_str);
 
-        if (d_S) cudaFree(d_S);
-        cudaFree(d_Q); cudaFree(d_K); cudaFree(d_V); cudaFree(d_O); cudaFree(d_Delta);
+        if (S) cudaFree(S);
+        cudaFree(Q); cudaFree(K); cudaFree(V); cudaFree(O); cudaFree(Delta);
         cudaEventDestroy(start); cudaEventDestroy(stop);
     }
-    printf("=======================================================================\n");
+    printf("===========================================================\n");
 
-    cudaFree(d_flush);
+    cudaFree(flush_buf);
     return 0;
 }
