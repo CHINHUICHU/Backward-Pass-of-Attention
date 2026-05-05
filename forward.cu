@@ -6,6 +6,7 @@
 #define D 64         // Head Dimension
 #define BR 64        // Block Row Size
 #define BC 32        // Block Col Size
+#define NITER 10     // Timing iterations to average
 
 #define CHECK_CUDA(call) \
 { \
@@ -108,7 +109,7 @@ void standard_attention(
 }
 
 // ---------------------------------------------------------------
-// Flash Forward (Register-only)
+// Flash Forward
 // ---------------------------------------------------------------
 //
 // Qi[D], Oi[D], Pij[BC] held entirely in per-thread registers.
@@ -213,36 +214,54 @@ int main() {
         // --- SEPARATE KERNELS RUN ---
         float ms_sep = -1.0f;
         if (S != nullptr) {
-            cudaMemset(O, 0, sz_f);
-            flush_l2_cache_kernel<<<flush_size/256, 256>>>(flush_buf, flush_size);
-            cudaDeviceSynchronize();
-            cudaEventRecord(start);
+            // Warmup
             standard_attention(Q, K, V, S, O, T, D);
-            cudaEventRecord(stop);
-            cudaEventSynchronize(stop);
-            cudaEventElapsedTime(&ms_sep, start, stop);
+            cudaDeviceSynchronize();
+
+            ms_sep = 0.0f;
+            for (int iter = 0; iter < NITER; iter++) {
+                cudaMemset(O, 0, sz_f);
+                flush_l2_cache_kernel<<<flush_size/256, 256>>>(flush_buf, flush_size);
+                cudaDeviceSynchronize();
+                cudaEventRecord(start);
+                standard_attention(Q, K, V, S, O, T, D);
+                cudaEventRecord(stop);
+                cudaEventSynchronize(stop);
+                float ms; cudaEventElapsedTime(&ms, start, stop);
+                ms_sep += ms;
+            }
+            ms_sep /= NITER;
         }
 
         // --- FLASH RUN ---
         float ms_ff = -1.0f;
-        flush_l2_cache_kernel<<<flush_size/256, 256>>>(flush_buf, flush_size);
-        cudaDeviceSynchronize();
-        cudaEventRecord(start);
+        const char *flash_err_str = nullptr;
         {
             dim3 block(BR);
             dim3 grid((T + BR - 1) / BR);
+
+            // Warmup
             flash_forward_kernel<<<grid, block>>>(Q, K, V, O, Delta, T);
-        }
-        cudaEventRecord(stop);
-        const char *flash_err_str = nullptr;
-        {
-            cudaError_t sync_err = cudaEventSynchronize(stop);
-            if (sync_err == cudaSuccess) {
-                cudaEventElapsedTime(&ms_ff, start, stop);
-            } else {
-                flash_err_str = cudaGetErrorString(sync_err);
-                clear_cuda_error();
+            cudaDeviceSynchronize();
+
+            ms_ff = 0.0f;
+            for (int iter = 0; iter < NITER; iter++) {
+                flush_l2_cache_kernel<<<flush_size/256, 256>>>(flush_buf, flush_size);
+                cudaDeviceSynchronize();
+                cudaEventRecord(start);
+                flash_forward_kernel<<<grid, block>>>(Q, K, V, O, Delta, T);
+                cudaEventRecord(stop);
+                cudaError_t sync_err = cudaEventSynchronize(stop);
+                if (sync_err != cudaSuccess) {
+                    flash_err_str = cudaGetErrorString(sync_err);
+                    clear_cuda_error();
+                    ms_ff = -1.0f;
+                    break;
+                }
+                float ms; cudaEventElapsedTime(&ms, start, stop);
+                ms_ff += ms;
             }
+            if (ms_ff >= 0.0f) ms_ff /= NITER;
         }
 
         // --- LOGGING ---
