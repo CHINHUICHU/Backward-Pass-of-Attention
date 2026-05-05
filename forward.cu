@@ -167,17 +167,18 @@ __global__ void flash_forward_kernel(
 }
 
 int main() {
-    int fwd_sizes[] = {1024, 2048, 4096, 8192, 16384, 32768, 65536};
-    int num_fwd = 7;
+    int fwd_sizes[] = {1024, 2048, 4096, 8192, 16384, 32768};
+    int num_fwd = 6;
 
     int flush_size = 64 * 1024 * 1024;
     float *flush_buf;
     CHECK_CUDA(cudaMalloc(&flush_buf, flush_size * sizeof(float)));
 
-    printf("===========================================================\n");
-    printf("|              Forward Pass Benchmark                    |\n");
-    printf("| %-8s | %-15s | %-15s |\n", "Seq Len", "Separate(ms)", "Flash(ms)");
-    printf("===========================================================\n");
+    printf("==============================================================================\n");
+    printf("|                      Forward Pass Benchmark                             |\n");
+    printf("| %-8s | %-12s | %-13s | %-12s | %-13s |\n",
+           "Seq Len", "Sep (ms)", "Sep (TFLOPS)", "Flash (ms)", "Flash (TFLOPS)");
+    printf("==============================================================================\n");
 
     for (int t = 0; t < num_fwd; t++) {
         int T = fwd_sizes[t];
@@ -265,17 +266,30 @@ int main() {
         }
 
         // --- LOGGING ---
-        char s_str[16], f_str[64];
-        if (ms_sep < 0)   sprintf(s_str, "OOM/SKIP"); else sprintf(s_str, "%.2f", ms_sep);
-        if (ms_ff < 0)    snprintf(f_str, sizeof(f_str), "ERR: %s", flash_err_str ? flash_err_str : "unknown");
-        else              sprintf(f_str, "%.2f", ms_ff);
-        printf("| %-8d | %-15s | %-15s |\n", T, s_str, f_str);
+        // 4*T^2*D: two matmuls (QK^T and PV), each 2*T^2*D FLOPs
+        double flops = 4.0 * (double)T * T * D;
+        char s_ms[16], s_tfl[16], f_ms[64], f_tfl[16];
+
+        if (ms_sep < 0) {
+            sprintf(s_ms, "OOM/SKIP"); sprintf(s_tfl, "N/A");
+        } else {
+            sprintf(s_ms,  "%.2f", ms_sep);
+            sprintf(s_tfl, "%.3f", flops / (ms_sep * 1e9));
+        }
+        if (ms_ff < 0) {
+            snprintf(f_ms, sizeof(f_ms), "ERR: %s", flash_err_str ? flash_err_str : "unknown");
+            sprintf(f_tfl, "N/A");
+        } else {
+            sprintf(f_ms,  "%.2f", ms_ff);
+            sprintf(f_tfl, "%.3f", flops / (ms_ff * 1e9));
+        }
+        printf("| %-8d | %-12s | %-13s | %-12s | %-13s |\n", T, s_ms, s_tfl, f_ms, f_tfl);
 
         if (S) cudaFree(S);
         cudaFree(Q); cudaFree(K); cudaFree(V); cudaFree(O); cudaFree(Delta);
         cudaEventDestroy(start); cudaEventDestroy(stop);
     }
-    printf("===========================================================\n");
+    printf("==============================================================================\n");
 
     cudaFree(flush_buf);
     return 0;
